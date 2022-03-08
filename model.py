@@ -1,7 +1,9 @@
 import jittor as jt
+import jittor.nn as nn
 import numpy as np
 import random
 from math import sqrt
+from jittor.models import vgg16
 
 class EqualLR:
     def __init__(self, name):
@@ -395,29 +397,10 @@ class Generator(jt.Module):
     def execute(self, style, noise, step=0, alpha=-1, mixing_range=(-1, -1)):
         out = noise[0]
 
-        if len(style) < 2:
-            inject_index = [len(self.progression) + 1]
-        else:
-            inject_index = sorted(random.sample(list(range(step)), len(style) - 1))
-
-        crossover = 0
-
         for i, (conv, to_rgb) in enumerate(zip(self.progression, self.to_rgb)):
-            if mixing_range == (-1, -1):
-                if crossover < len(inject_index) and i > inject_index[crossover]:
-                    crossover = min(crossover + 1, len(style))
-                style_step = style[crossover]
-            else:
-                if mixing_range[0] <= i <= mixing_range[1]:
-                    style_step = style[1]
-                else:
-                    style_step = style[0]
-
             if i > 0 and step > 0:
                 out_prev = out
-                
-            out = conv(out, style_step, noise[i])
-
+            out = conv(out, style[i], noise[i])
             if i == step:
                 out = to_rgb(out)
                 if i > 0 and 0 <= alpha < 1:
@@ -449,12 +432,14 @@ class StyledGenerator(jt.Module):
         style_weight=0,
         mixing_range=(-1, -1),
     ):
+        #'''
         styles = []
         if type(input) not in (list, tuple):
             input = [input]
 
         for i in input:
             styles.append(self.style(i))
+        #'''
 
         batch = input[0].shape[0]
 
@@ -464,17 +449,166 @@ class StyledGenerator(jt.Module):
                 size = 4 * 2 ** i
                 noise.append(jt.randn(batch, 1, size, size))
 
-        if mean_style is not None:
-            styles_norm = []
-            
-            for style in styles:
-                styles_norm.append(mean_style + style_weight * (style - mean_style))
-
-            styles = styles_norm
-
         return self.generator(styles, noise, step, alpha, mixing_range=mixing_range)
 
     def mean_style(self, input):
         style = self.style(input).mean(0, keepdims=True)
 
         return style
+
+class Z2WSpace(jt.Module):
+    def __init__(self, code_dim=512, n_mlp=8):
+        layers = [PixelNorm()]
+        for i in range(n_mlp):
+            layers.append(EqualLinear(code_dim, code_dim))
+            layers.append(jt.nn.LeakyReLU(0.2))
+        self.style = jt.nn.Sequential(*layers)
+    def execute(self, input):
+        return self.style(input)
+class ZP2WPSpace(jt.Module):
+    def __init__(self, n_layer, code_dim=512, n_mlp=8):
+        self.mlps = nn.Sequential()
+        for i in range(n_layer):
+            self.mlps.append(Z2WSpace(code_dim, n_mlp))
+        self.n_layer = n_layer
+    def execute(self, input):
+        output = nn.Sequential()
+        for i in range(self.n_layer):
+            output.append(self.mlps[i](input[i]))
+        return output
+class FeatExtract(jt.Module):
+    def __init__(self):
+        resnet = jt.models.Resnet50(pretrained=True)
+        self.feature_extract = nn.Sequential([
+            resnet.conv1,
+            resnet.bn1,
+            resnet.relu,
+            resnet.maxpool,
+            resnet.layer1,
+        ])
+        self.feature_extract_2 = resnet.layer2
+        self.feature_extract_3 = resnet.layer3
+        self.feature_extract_4 = resnet.layer4
+    def execute(self, ipt):
+        high = self.feature_extract(ipt)
+        #[12,256,32,32,]
+        mid = self.feature_extract_2(high)
+        #[12,512,16,16,]
+        low = self.feature_extract_3(mid)
+        #[12,1024,8,8,]
+        low = self.feature_extract_4(low)
+        #[12,2048,4,4,]
+        return high, mid, low
+class Map2Style(jt.Module):
+    def __init__(self, in_channel, out_channel, in_size):
+        self.map2style = nn.Sequential()
+        while in_channel != out_channel or in_size != 1:
+            next_channel = in_channel
+            if next_channel < out_channel:
+                next_channel *= 2
+            if next_channel > out_channel:
+                next_channel /= 2
+            self.map2style.append(nn.Conv(int(in_channel), int(next_channel), kernel_size=3, stride=2, padding=1))
+            self.map2style.append(nn.LeakyReLU(0.2))
+            in_channel = next_channel
+            in_size /= 2
+    def execute(self, ipt):
+        return self.map2style(ipt)
+class VAE(jt.Module):
+    def __init__(self, layers):
+        self.map2style5 = Map2Style(256, 512, 32)
+        self.map2style4 = Map2Style(256, 512, 32)
+        self.map2style3 = Map2Style(512, 512, 16)
+        self.map2style2 = Map2Style(512, 512, 16)
+        self.map2style1 = Map2Style(2048, 512, 4)
+        self.map2style0 = Map2Style(2048, 512, 4)
+        self.layers = layers
+        self.fc_mean = nn.Sequential()
+        self.fc_logvar = nn.Sequential()
+        for i in range(layers):
+            self.fc_mean.append(nn.Sequential([
+                nn.Linear(512, 512, bias=False),
+            ]))
+            self.fc_logvar.append(nn.Sequential([
+                nn.Linear(512, 512, bias=False),
+            ]))
+
+
+    def execute(self, high, mid, low):
+        mean = []
+        logvar = []
+        features = [self.map2style0(low), 
+                    self.map2style1(low), 
+                    self.map2style2(mid), 
+                    self.map2style3(mid), 
+                    self.map2style4(high), 
+                    self.map2style5(high),
+                    ]
+        for i in range(self.layers):
+            features[i] = features[i].reshape((features[i].shape[0], -1))
+        for i in range(self.layers):
+            mean.append(self.fc_mean[i](features[i]))
+            logvar.append(self.fc_logvar[i](features[i]))
+
+        return mean, logvar
+
+class PerceptualLoss(nn.Module):
+    def __init__(self, requires_grad=False):
+        #self.register_buffer('mean_rgb', mean_rgb)
+        #self.register_buffer('std_rgb', std_rgb)
+
+        vgg_pretrained_features = vgg16(pretrained=True).features
+        self.slice1 = nn.Sequential()
+        self.slice2 = nn.Sequential()
+        self.slice3 = nn.Sequential()
+        self.slice4 = nn.Sequential()
+        for x in range(4):
+            self.slice1.add_module(str(x), vgg_pretrained_features[x])
+        for x in range(4, 9):
+            self.slice2.add_module(str(x), vgg_pretrained_features[x])
+        for x in range(9, 16):
+            self.slice3.add_module(str(x), vgg_pretrained_features[x])
+        for x in range(16, 23):
+            self.slice4.add_module(str(x), vgg_pretrained_features[x])
+        if not requires_grad:
+            for param in self.parameters():
+                param.requires_grad = False
+
+    def normalize(self, x):
+        mean_rgb = jt.float32([0.485, 0.456, 0.406])
+        std_rgb = jt.float32([0.229, 0.224, 0.225])
+        out = x/2 + 0.5
+        out = (out - jt.view(mean_rgb, (1,3,1,1))) / jt.view(std_rgb, (1,3,1,1))
+        return out
+
+    def __call__(self, im1, im2, mask=None, conf_sigma=None):
+        im = jt.contrib.concat([im1,im2], 0)
+        im = self.normalize(im)  # normalize input
+
+        ## compute features
+        feats = []
+        f = self.slice1(im)
+        feats += [jt.misc.chunk(f, 2, dim=0)]
+        f = self.slice2(f)
+        feats += [jt.misc.chunk(f, 2, dim=0)]
+        f = self.slice3(f)
+        feats += [jt.misc.chunk(f, 2, dim=0)]
+        f = self.slice4(f)
+        feats += [jt.misc.chunk(f, 2, dim=0)]
+        losses = []
+        for f1, f2 in feats:
+            loss = (f1-f2)**2
+            loss = loss.mean()
+            #loss = (f1 * f2).sum() / ((f1 * f1).sqrt() * (f2 * f2).sqrt())
+            '''
+            if conf_sigma is not None:
+                loss = loss / (2*conf_sigma**2 +EPS) + (conf_sigma +EPS).log()
+            if mask is not None:
+                b, c, h, w = loss.shape
+                _, _, hm, wm = mask.shape
+                sh, sw = hm//h, wm//w
+                mask0 = nn.avg_pool2d(mask, kernel_size=(sh,sw), stride=(sh,sw)).expand_as(loss)
+                loss = (loss * mask0).sum() / mask0.sum()
+            '''
+            losses += [loss]
+        return sum(losses)

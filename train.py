@@ -1,15 +1,15 @@
 import jittor as jt
 import numpy as np
-from model import StyledGenerator, Discriminator
+from model import StyledGenerator, VAE, PerceptualLoss, ZP2WPSpace, FeatExtract
 import jittor.transform as transform
 from dataset import SymbolDataset
 from tqdm import tqdm
 import argparse
 import math
 import random
+from math import exp
 
 jt.flags.use_cuda = True
-jt.flags.log_silent = True
 
 def accumulate(model1, model2, decay=0.999):
     par1 = dict(model1.named_parameters())
@@ -26,23 +26,15 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Progressive Growing of GANs')
     parser.add_argument('path', type=str, help='path of specified dataset')
     parser.add_argument('--ckpt', default=None, type=str, help='load from previous checkpoints')
-    parser.add_argument('--init_size', default=8, type=int, help='initial image size')
     args = parser.parse_args()
     
     max_size  = 128
-    init_step = int(math.log2(args.init_size) - 2)
     max_step  = int(math.log2(max_size) - 2)
-    nsteps = max_step - init_step + 1
 
-    lr = 1e-3
-    mixing = True
-
-    code_size = 512
-    batch_size = {4: 512, 8: 256, 16: 128, 32: 64, 64: 32, 128: 16}
-    batch_default = 32
+    batch_size = 16
 
     phase = 150_000
-    max_iter = 100_000
+    max_iter = 10_000
 
     transform = transform.Compose([
         transform.ToPILImage(),
@@ -51,172 +43,89 @@ if __name__ == '__main__':
         transform.ImageNormalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
     
-    netG = StyledGenerator(code_dim=code_size)
-    netD = Discriminator(from_rgb_activate=True)
-    g_running = StyledGenerator(code_size)
-    g_running.eval()
+    lr = 1e-3
 
-    d_optimizer = jt.optim.Adam(netD.parameters(), lr=lr, betas=(0.0, 0.99))
-    g_optimizer = jt.optim.Adam(netG.generator.parameters(), lr=lr, betas=(0.0, 0.99))
-    g_optimizer.add_param_group({
-        'params': netG.style.parameters(),
-        'lr': lr * 0.01,
-        'mult': 0.01,
-        }
-    )
+    step = 5
+    netG = StyledGenerator(code_dim=512)
+    vae = VAE(step + 1)
+    feat_extract = FeatExtract()
+    vae_optimizer = jt.optim.Adam(vae.parameters(), lr=lr, betas=(0.0, 0.99))
+    '''
+    zp2wpspace = ZP2WPSpace(step + 1)
+    vae_optimizer.add_param_group(
+        {'params':zp2wpspace.parameters(),
+        'lr':lr,
+        'betas':(0.0, 0.99)})
+    '''
+    ckpt = jt.load(args.ckpt)
 
-    accumulate(g_running, netG, 0)
-    
-    if args.ckpt is not None:
-        ckpt = jt.load(args.ckpt)
+    netG.load_state_dict(ckpt)
+    p_loss = PerceptualLoss()
+    print('Generator loaded')
 
-        netG.load_state_dict(ckpt['generator'])
-        netD.load_state_dict(ckpt['discriminator'])
-        g_running.load_state_dict(ckpt['g_running'])
-
-        print('resuming from checkpoint .......')
-        
+    #saved = jt.load('FFHQ/checkpoint/vae_train_step-1500.model')
+    #vae.load_state_dict(saved['vae'])
     ## Actual Training
-    step = init_step
     resolution = int(4 * 2 ** step)
-    image_loader = SymbolDataset(args.path, transform, resolution).set_attrs(
-        batch_size=batch_size.get(resolution, batch_default), 
+    image_loader = SymbolDataset(args.path, transform, 1000).set_attrs(
+        batch_size=batch_size, 
         shuffle=True
     )
     train_loader = iter(image_loader)
+    print('image loader')
 
+    #requires_grad(vae, True)
     requires_grad(netG, False)
-    requires_grad(netD, True)
+    requires_grad(feat_extract, False)
+    netG.eval()
 
-    disc_loss_val = 0
-    gen_loss_val = 0
-    grad_loss_val = 0
-
-    alpha = 0
-    used_sample = 0
-    final_progress = False
     pbar = tqdm(range(max_iter))
 
-    for i in pbar:
-        alpha = min(1, 1 / phase * (used_sample + 1))
-        if (resolution == args.init_size and args.ckpt is None) or final_progress:
-            alpha = 1
-        
-        if used_sample > phase * 2:
-            used_sample = 0
-            step += 1
-
-            if step > max_step:
-                step = max_step
-                final_progress = True
-                ckpt_step = step + 1
-            else:
-                alpha = 0
-                ckpt_step = step
-
-            resolution = 4 * 2 ** step
-
-            image_loader = SymbolDataset(args.path, transform, resolution).set_attrs(
-                batch_size=batch_size.get(resolution, batch_default), 
-                shuffle=True
-            )
-            train_loader = iter(image_loader)
-
-            jt.save(
-                {
-                    'generator': netG.state_dict(),
-                    'discriminator': netD.state_dict(),
-                    'g_running': g_running.state_dict(),
-                },
-                f'FFHQ/checkpoint/train_step-{ckpt_step}.model',
-            )
-
+    for batch in pbar:
         try:
             real_image = next(train_loader)
         except (OSError, StopIteration):
             train_loader = iter(image_loader)
             real_image = next(train_loader)
-
         real_image.requires_grad = True
         b_size = real_image.size(0)
+        tot_loss = 0
+        high, mid, low = feat_extract(real_image)
+        mean, logvar = vae(high, mid, low)
+        noises = []
+        code = []
+        kl_loss = jt.float32([0])
+        print("mean ", mean[0].data.mean())
+        print("var ", logvar[0].exp().data.mean())
+        for i in range(step + 1):
+            '''
+            noise = jt.randn((b_size, 512))
+            code.append(mean[i] + noise * (logvar[i] / 2).exp())
+            kl_loss += -0.5 * (1 + logvar[i] - mean[i] * mean[i] - logvar[i].exp()).sum()
+            '''
+            code.append(mean[i])
+            kl_loss += -0.5 * (1 - mean[i] * mean[i]).mean()
+            #'''
+        kl_loss *= 5e-4
 
-        real_scores = netD(real_image, step=step, alpha=alpha)
-        real_predict = jt.nn.softplus(-real_scores).mean()
-
-        grad_real = jt.grad(real_scores.sum(), real_image)
-        grad_penalty = (
-            grad_real.reshape(grad_real.size(0), -1).norm(2, dim=1) ** 2
-        ).mean()
-        grad_penalty = 10 / 2 * grad_penalty
-
-        if i % 10 == 0:
-            grad_loss_val = grad_penalty.item()
-
-        if mixing and random.random() < 0.9:
-            gen_in11, gen_in12, gen_in21, gen_in22 = jt.randn(4, b_size, code_size).chunk(4, 0)
-            gen_in1 = [gen_in11.squeeze(0), gen_in12.squeeze(0)]
-            gen_in2 = [gen_in21.squeeze(0), gen_in22.squeeze(0)]
-        else:
-            gen_in1, gen_in2 = jt.randn(2, b_size, code_size).chunk(2, 0)
-            gen_in1 = gen_in1.squeeze(0)
-            gen_in2 = gen_in2.squeeze(0)
-
-        fake_image = netG(gen_in1, step=step, alpha=alpha)
-        fake_predict = netD(fake_image, step=step, alpha=alpha)
-        fake_predict = jt.nn.softplus(fake_predict).mean()
-
-        if i % 10 == 0:
-            disc_loss_val = (real_predict + fake_predict).item()
-
-        loss_D = real_predict + grad_penalty + fake_predict
-        d_optimizer.step(loss_D)
-
-        # optimize generator
-
-        requires_grad(netG, True)
-        requires_grad(netD, False)
-
-        fake_image = netG(gen_in2, step=step, alpha=alpha)
-        predict = netD(fake_image, step=step, alpha=alpha)
-        loss_G = jt.nn.softplus(-predict).mean()
-
-        if i % 10 == 0:
-            gen_loss_val = loss_G.item()
-
-        g_optimizer.step(loss_G)
-
-        accumulate(g_running, netG)
-        requires_grad(netG, False)
-        requires_grad(netD, True)
-
-        used_sample += real_image.shape[0]
-
-        if (i + 1) % 100 == 0:
-            images = []
-
-            gen_i, gen_j = (10, 5)
-
-            with jt.no_grad():
-                for _ in range(gen_i):
-                    images.append(
-                        g_running(
-                            jt.randn(gen_j, code_size), step=step, alpha=alpha
-                        ).data
-                    )
-
-            jt.save_image(
-                jt.concat(images, 0),
-                f'FFHQ/sample/{str(i + 1).zfill(6)}.png',
-                nrow=gen_i,
-                normalize=True,
-                range=(-1, 1),
+        #code = zp2wpspace(code)
+        opt = netG(code, step=step)
+        l2_loss = jt.nn.MSELoss()(real_image, opt)
+        per_loss = p_loss(real_image, opt)
+        per_loss *= .05
+        tot_loss += kl_loss
+        tot_loss += l2_loss
+        tot_loss += per_loss
+        print("l2_loss ", l2_loss.data.sum(), "per_loss", per_loss.data.sum(), "kl_loss", kl_loss.data.sum())
+        vae_optimizer.step(tot_loss)
+        print("tot_loss ", tot_loss.data.sum())
+        if batch % 500 == 0:
+            ev = jt.contrib.concat([real_image, opt], 0)
+            jt.save_image(ev, 'style_mixing/ev' + str(batch) + '.png', normalize=True, range=(-1, 1))
+        if batch % 1000 == 0 and batch != 0:
+            jt.save(
+                {
+                    'vae': vae.state_dict(),
+                },
+                f'FFHQ/checkpoint/vae_train_step-{batch}.model',
             )
-
-        if (i + 1) % 10000 == 0:
-            jt.save(g_running.state_dict(), f'FFHQ/checkpoint/{str(i + 1).zfill(6)}.model')
-
-        state_msg = (
-            f'Size: {4 * 2 ** step}; G: {gen_loss_val:.3f}; D: {disc_loss_val:.3f};'
-            f' Grad: {grad_loss_val:.3f}; Alpha: {alpha:.5f}'
-        )
-        pbar.set_description(state_msg)

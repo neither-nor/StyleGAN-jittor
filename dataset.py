@@ -3,12 +3,12 @@ import matplotlib.pyplot as plt
 import os
 
 class SymbolDataset(Dataset):
-    def __init__(self, root_path, transform, resolution):
+    def __init__(self, root_path, transform, max_size=-1):
         super().__init__()
         
-        resolution_path = os.path.join(root_path, str(resolution))
+        resolution_path = os.path.join(root_path)
         train_image = []
-
+        size = 0
         for image_file in os.listdir(resolution_path):
             image_path = os.path.join(resolution_path, image_file)
             ext = os.path.splitext(image_path)[-1]
@@ -23,10 +23,13 @@ class SymbolDataset(Dataset):
                 
             image = image.astype('uint8')
             train_image.append(image)
-                
+            size += 1
+            if size % 1000 == 0:
+                print("loaded " + str(size) + " images")
+            if size >= max_size and max_size > 0:
+                break
         self.train_image = train_image
         self.transform  = transform
-        self.resolution = resolution
         
     def __len__(self):
         return len(self.train_image)
