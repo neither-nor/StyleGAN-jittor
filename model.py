@@ -509,6 +509,7 @@ class Map2Style(jt.Module):
             if next_channel > out_channel:
                 next_channel /= 2
             self.map2style.append(nn.Conv(int(in_channel), int(next_channel), kernel_size=3, stride=2, padding=1))
+            self.map2style.append(nn.BatchNorm(int(next_channel)))
             self.map2style.append(nn.LeakyReLU(0.2))
             in_channel = next_channel
             in_size /= 2
@@ -528,9 +529,13 @@ class VAE(jt.Module):
         for i in range(layers):
             self.fc_mean.append(nn.Sequential([
                 nn.Linear(512, 512, bias=False),
+                #nn.BatchNorm(512),
+                #nn.LeakyReLU(0.1),
             ]))
             self.fc_logvar.append(nn.Sequential([
                 nn.Linear(512, 512, bias=False),
+                #nn.BatchNorm(512),
+                #nn.LeakyReLU(0.1),
             ]))
 
 
@@ -584,7 +589,6 @@ class PerceptualLoss(nn.Module):
     def __call__(self, im1, im2, mask=None, conf_sigma=None):
         im = jt.contrib.concat([im1,im2], 0)
         im = self.normalize(im)  # normalize input
-
         ## compute features
         feats = []
         f = self.slice1(im)
@@ -595,7 +599,8 @@ class PerceptualLoss(nn.Module):
         feats += [jt.misc.chunk(f, 2, dim=0)]
         f = self.slice4(f)
         feats += [jt.misc.chunk(f, 2, dim=0)]
-        losses = []
+        losses = jt.float32(0)
+        l_feats = len(feats)
         for f1, f2 in feats:
             loss = (f1-f2)**2
             loss = loss.mean()
@@ -610,5 +615,5 @@ class PerceptualLoss(nn.Module):
                 mask0 = nn.avg_pool2d(mask, kernel_size=(sh,sw), stride=(sh,sw)).expand_as(loss)
                 loss = (loss * mask0).sum() / mask0.sum()
             '''
-            losses += [loss]
-        return sum(losses)
+            losses += loss / l_feats
+        return losses

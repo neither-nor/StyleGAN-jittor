@@ -32,9 +32,12 @@ if __name__ == '__main__':
     max_step  = int(math.log2(max_size) - 2)
 
     batch_size = 16
+    data_size = 16000
+    max_epoch = 50
 
-    phase = 150_000
-    max_iter = 10_000
+    batch_per_epoch = (data_size + batch_size - 1) // batch_size
+
+    max_iter = max_epoch * batch_per_epoch
 
     transform = transform.Compose([
         transform.ToPILImage(),
@@ -46,7 +49,7 @@ if __name__ == '__main__':
     lr = 1e-3
 
     step = 5
-    netG = StyledGenerator(code_dim=512)
+    generator = StyledGenerator(code_dim=512)
     vae = VAE(step + 1)
     feat_extract = FeatExtract()
     vae_optimizer = jt.optim.Adam(vae.parameters(), lr=lr, betas=(0.0, 0.99))
@@ -58,8 +61,9 @@ if __name__ == '__main__':
         'betas':(0.0, 0.99)})
     '''
     ckpt = jt.load(args.ckpt)
-
-    netG.load_state_dict(ckpt)
+    for k in ckpt.keys():
+        print(k)
+    generator.load_state_dict(ckpt)
     p_loss = PerceptualLoss()
     print('Generator loaded')
 
@@ -67,7 +71,7 @@ if __name__ == '__main__':
     #vae.load_state_dict(saved['vae'])
     ## Actual Training
     resolution = int(4 * 2 ** step)
-    image_loader = SymbolDataset(args.path, transform, 1000).set_attrs(
+    image_loader = SymbolDataset(args.path, transform, data_size).set_attrs(
         batch_size=batch_size, 
         shuffle=True
     )
@@ -75,19 +79,17 @@ if __name__ == '__main__':
     print('image loader')
 
     #requires_grad(vae, True)
-    requires_grad(netG, False)
+    requires_grad(generator, False)
     requires_grad(feat_extract, False)
-    netG.eval()
+    generator.eval()
 
     pbar = tqdm(range(max_iter))
-
     for batch in pbar:
         try:
             real_image = next(train_loader)
         except (OSError, StopIteration):
             train_loader = iter(image_loader)
             real_image = next(train_loader)
-        real_image.requires_grad = True
         b_size = real_image.size(0)
         tot_loss = 0
         high, mid, low = feat_extract(real_image)
@@ -98,10 +100,10 @@ if __name__ == '__main__':
         print("mean ", mean[0].data.mean())
         print("var ", logvar[0].exp().data.mean())
         for i in range(step + 1):
-            '''
+            #'''
             noise = jt.randn((b_size, 512))
             code.append(mean[i] + noise * (logvar[i] / 2).exp())
-            kl_loss += -0.5 * (1 + logvar[i] - mean[i] * mean[i] - logvar[i].exp()).sum()
+            kl_loss += -0.5 * (1 + logvar[i] - mean[i] * mean[i] - logvar[i].exp()).mean() / b_size
             '''
             code.append(mean[i])
             kl_loss += -0.5 * (1 - mean[i] * mean[i]).mean()
@@ -109,23 +111,24 @@ if __name__ == '__main__':
         kl_loss *= 5e-4
 
         #code = zp2wpspace(code)
-        opt = netG(code, step=step)
+        opt = generator(code, step=step)
         l2_loss = jt.nn.MSELoss()(real_image, opt)
         per_loss = p_loss(real_image, opt)
-        per_loss *= .05
+        per_loss *= .8
         tot_loss += kl_loss
         tot_loss += l2_loss
         tot_loss += per_loss
         print("l2_loss ", l2_loss.data.sum(), "per_loss", per_loss.data.sum(), "kl_loss", kl_loss.data.sum())
         vae_optimizer.step(tot_loss)
         print("tot_loss ", tot_loss.data.sum())
-        if batch % 500 == 0:
+        if batch % batch_per_epoch == 0:
             ev = jt.contrib.concat([real_image, opt], 0)
-            jt.save_image(ev, 'style_mixing/ev' + str(batch) + '.png', normalize=True, range=(-1, 1))
-        if batch % 1000 == 0 and batch != 0:
-            jt.save(
-                {
-                    'vae': vae.state_dict(),
-                },
-                f'FFHQ/checkpoint/vae_train_step-{batch}.model',
-            )
+            epoch = int(batch / batch_per_epoch)
+            jt.save_image(ev, 'style_mixing/ev' + str(epoch) + '.png', normalize=True, range=(-1, 1))
+            if epoch % 5 == 0:
+                jt.save(
+                    {
+                        'vae': vae.state_dict(),
+                 },
+                 f'/home/jiangchunyu/data/checkpoint/vae_train_step-{epoch}.model',
+                )
